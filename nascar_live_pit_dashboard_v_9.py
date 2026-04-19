@@ -8,7 +8,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="NASCAR Race Intelligence v10", layout="wide")
+st.set_page_config(page_title="NASCAR Race Intelligence v11", layout="wide")
 
 LIVE_FEED_URL = "https://cf.nascar.com/live/feeds/live-feed.json"
 REQUEST_TIMEOUT = 10
@@ -176,7 +176,8 @@ def enrich(df: pd.DataFrame, hist: pd.DataFrame) -> pd.DataFrame:
     hist["stint_start_lap"] = hist["last_pit"].fillna(0)
     hist["lsp"] = hist["lap"] - hist["stint_start_lap"]
 
-    def pred(g: pd.DataFrame) -> pd.Series:
+    pred_rows = []
+    for vehicle, g in hist.groupby("vehicle"):
         g = g.sort_values("lap").copy()
         green = g[g["flag_state"] == GREEN_FLAG_STATE].copy()
         recent_green = green["lap_time"].dropna().tail(8)
@@ -197,17 +198,16 @@ def enrich(df: pd.DataFrame, hist: pd.DataFrame) -> pd.DataFrame:
                 penalty = 0.5
 
         pred_val = base + penalty if pd.notna(base) else np.nan
-
-        return pd.Series(
+        pred_rows.append(
             {
-                "vehicle": str(g.name),
+                "vehicle": str(vehicle),
                 "pred": pred_val,
                 "lsp": lsp_green,
                 "prediction_basis": "Green" if not green.empty else "Mixed/None",
             }
         )
 
-    preds = hist.groupby("vehicle", group_keys=False).apply(pred).reset_index(drop=True)
+    preds = pd.DataFrame(pred_rows)
     out = df.merge(preds, on="vehicle", how="left")
     out["pace"] = out["pred"].fillna(out["lap_time"])
     out["delta_pred"] = out["lap_time"] - out["pred"]
@@ -384,7 +384,7 @@ def render_banner(snap: pd.DataFrame) -> None:
 
 def main() -> None:
     st.title("🏎️ NASCAR Race Intelligence")
-    st.caption("Bundled version with banner, flag status, tire fix, and green-lap prediction")
+    st.caption("Deploy-safe bundle with banner, flag status, tire fix, and green-lap prediction")
 
     auto = st.sidebar.checkbox("Auto Refresh", True)
     rate = st.sidebar.slider("Seconds", 3, 10, 5)
