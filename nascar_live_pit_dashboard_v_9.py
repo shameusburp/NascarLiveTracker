@@ -95,10 +95,26 @@ def enrich(df, hist):
 
     out["delta"] = out["lap_time"] - out["pred"]
 
-    out["tire"]=out.apply(lambda r:
-        "Fresh" if r["lsp"]<=3 else
-        "Mid" if r["lsp"]<=15 else
-        "Falloff",axis=1)
+    def tire_phase(r):
+        lsp = r["lsp"]
+        pit_count = safe_int(r.get("pit_count")) or 0
+        if pd.isna(lsp):
+            return "—"
+        if pit_count == 0:
+            if lsp <= 3:
+                return "Start Run"
+            elif lsp <= 15:
+                return "Opening Stint"
+            else:
+                return "Long Opening Stint"
+        if lsp <= 3:
+            return "Fresh"
+        elif lsp <= 15:
+            return "Mid"
+        else:
+            return "Falloff"
+
+    out["tire"] = out.apply(tire_phase, axis=1)
 
     return out
 
@@ -108,7 +124,6 @@ def format_table(df):
         "Pos":df["pos"],
         "#":df["vehicle"],
         "Driver":df["driver"],
-        "Flag":df["flag_state"].map(flag_label),
         "Last":df["lap_time"].map(lambda x:f"{x:.3f}" if pd.notna(x) else "—"),
         "Next":df["pred"].map(lambda x:f"{x:.3f}" if pd.notna(x) else "—"),
         "Δ":df["delta"].map(lambda x:f"{x:+.3f}" if pd.notna(x) else "—"),
@@ -160,6 +175,7 @@ c2.metric("Lap",leader["lap"])
 c3.metric("Flag",flag_label(leader["flag_state"]))
 c4.metric("Fastest",f"{table['lap_time'].min():.3f}")
 
-st.dataframe(format_table(table),use_container_width=True,hide_index=True)
+display_table = format_table(table)
+st.dataframe(display_table,use_container_width=True,hide_index=True)
 
 st.rerun()
