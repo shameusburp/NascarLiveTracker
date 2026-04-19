@@ -8,10 +8,11 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="NASCAR Race Intelligence v9", layout="wide")
+st.set_page_config(page_title="NASCAR Race Intelligence v10", layout="wide")
 
 LIVE_FEED_URL = "https://cf.nascar.com/live/feeds/live-feed.json"
 REQUEST_TIMEOUT = 10
+GREEN_FLAG_STATE = 1
 
 st.markdown(
     """
@@ -78,6 +79,20 @@ def safe_str(value: Any):
     if value in [None, ""]:
         return None
     return str(value)
+
+
+def flag_label(flag_value: Any) -> str:
+    mapping = {
+        1: "Green",
+        2: "Yellow",
+        3: "Red",
+        4: "Checkered",
+        5: "White",
+    }
+    parsed = safe_int(flag_value)
+    if parsed is None:
+        return "—"
+    return mapping.get(parsed, str(parsed))
 
 
 def normalize(data: dict) -> pd.DataFrame:
@@ -158,32 +173,43 @@ def enrich(df: pd.DataFrame, hist: pd.DataFrame) -> pd.DataFrame:
 
     hist = hist.sort_values(["vehicle", "lap", "ts"]).drop_duplicates(["vehicle", "lap"], keep="last")
     hist["last_pit"] = hist.groupby("vehicle")["last_pit"].ffill()
-    hist["lsp"] = hist["lap"] - hist["last_pit"]
-    hist.loc[hist["last_pit"].isna(), "lsp"] = np.nan
+    hist["stint_start_lap"] = hist["last_pit"].fillna(0)
+    hist["lsp"] = hist["lap"] - hist["stint_start_lap"]
 
     def pred(g: pd.DataFrame) -> pd.Series:
-        laps = g["lap_time"].dropna().tail(8)
-        base = float(laps.median()) if len(laps) >= 3 else np.nan
-        cur = g.iloc[-1]
-        lsp = cur.get("lsp")
+        g = g.sort_values("lap").copy()
+        green = g[g["flag_state"] == GREEN_FLAG_STATE].copy()
+        recent_green = green["lap_time"].dropna().tail(8)
+        base = float(recent_green.median()) if len(recent_green) >= 3 else np.nan
+
+        if not green.empty:
+            current_green = green.iloc[-1]
+            lsp_green = current_green.get("lsp")
+        else:
+            current_green = g.iloc[-1]
+            lsp_green = current_green.get("lsp")
 
         penalty = 0.0
-        if pd.notna(lsp):
-            if lsp <= 1:
+        if pd.notna(lsp_green):
+            if lsp_green <= 1:
                 penalty = 1.2
-            elif lsp == 2:
+            elif lsp_green == 2:
                 penalty = 0.5
+
+        pred_val = base + penalty if pd.notna(base) else np.nan
 
         return pd.Series(
             {
                 "vehicle": str(g.name),
-                "pred": base + penalty if pd.notna(base) else np.nan,
-                "lsp": lsp,
+                "pred": pred_val,
+                "lsp": lsp_green,
+                "prediction_basis": "Green" if not green.empty else "Mixed/None",
             }
         )
 
     preds = hist.groupby("vehicle", group_keys=False).apply(pred).reset_index(drop=True)
     out = df.merge(preds, on="vehicle", how="left")
+    out["pace"] = out["pred"].fillna(out["lap_time"])
     out["delta_pred"] = out["lap_time"] - out["pred"]
 
     med = out["lap_time"].median()
@@ -192,17 +218,23 @@ def enrich(df: pd.DataFrame, hist: pd.DataFrame) -> pd.DataFrame:
     out.loc[(out["lsp"] >= 15), "strategy"] = "Overcut"
     out.loc[out["delta_pred"] < -0.2, "strategy"] = "Gaining"
 
-    def tire_phase(x: Any) -> str:
-        if pd.isna(x):
+    def tire_phase(lsp: Any, pit_count: Any) -> str:
+        pit_count_int = safe_int(pit_count) or 0
+        if pd.isna(lsp):
             return "—"
-        if x <= 3:
+        if pit_count_int == 0:
+            if lsp <= 3:
+                return "Start Run"
+            if lsp <= 15:
+                return "Opening Stint"
+            return "Long Opening Stint"
+        if lsp <= 3:
             return "Fresh"
-        if x <= 15:
+        if lsp <= 15:
             return "Mid"
         return "Falloff"
 
-    out["tire"] = out["lsp"].apply(tire_phase)
-    out["pace"] = out["pred"].fillna(out["lap_time"])
+    out["tire"] = out.apply(lambda r: tire_phase(r["lsp"], r["pit_count"]), axis=1)
     out["pace_rank"] = out["pace"].rank(method="min")
 
     max_pos = out["pos"].max() if out["pos"].notna().any() else 1
@@ -264,7 +296,15 @@ def simulate(df: pd.DataFrame) -> pd.DataFrame:
 
 def format_table(df: pd.DataFrame) -> pd.DataFrame:
     strat = {"Undercut": "🟢", "Overcut": "🟠", "Gaining": "🔵", "": ""}
-    tire = {"Fresh": "🟢", "Mid": "🟠", "Falloff": "🔴", "—": "⚪"}
+    tire = {
+        "Start Run": "🟢",
+        "Opening Stint": "🟠",
+        "Long Opening Stint": "🔴",
+        "Fresh": "🟢",
+        "Mid": "🟠",
+        "Falloff": "🔴",
+        "—": "⚪",
+    }
     call = {"PIT": "🟢 PIT", "STAY": "🟠 STAY", "HOLD": "⚪ HOLD"}
 
     out = pd.DataFrame(
@@ -272,6 +312,7 @@ def format_table(df: pd.DataFrame) -> pd.DataFrame:
             "Pos": df["pos"],
             "#": df["vehicle"],
             "Driver": df["driver"],
+            "Flag": df["flag_state"].map(flag_label),
             "Last": df["lap_time"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "—"),
             "Next": df["pred"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "—"),
             "Δ": df["delta_pred"].map(lambda x: f"{x:+.2f}" if pd.notna(x) else "—"),
@@ -279,6 +320,7 @@ def format_table(df: pd.DataFrame) -> pd.DataFrame:
             "Tire": df["tire"].map(lambda x: (tire.get(x, "") + " " + x).strip()),
             "Call": df["call"].map(call),
             "Win%": df["win"].map(lambda x: f"{x:.1f}%" if pd.notna(x) else "—"),
+            "Pred Basis": df["prediction_basis"],
         }
     )
     if not out.empty:
@@ -300,7 +342,7 @@ def lap_chart(hist: pd.DataFrame, selected) -> alt.Chart:
             x=alt.X("lap:Q", title="Lap"),
             y=alt.Y("lap_time:Q", title="Lap Time (s)"),
             color=alt.Color("vehicle:N", title="Car"),
-            tooltip=["vehicle", "driver", "lap", "lap_time"],
+            tooltip=["vehicle", "driver", "lap", "lap_time", "flag_state"],
         )
         .properties(height=320)
     )
@@ -316,8 +358,14 @@ def render_banner(snap: pd.DataFrame) -> None:
     time_text = row.get("snapshot_time_utc") or datetime.utcnow().strftime("%H:%M:%S UTC")
     lap = row.get("lap")
     race_id = row.get("race_id")
+    flag = row.get("flag_state")
 
-    subtitle_parts = [f"Date: {date_text}", f"Session: {session}", f"Updated: {time_text}"]
+    subtitle_parts = [
+        f"Date: {date_text}",
+        f"Session: {session}",
+        f"Flag: {flag_label(flag)}",
+        f"Updated: {time_text}",
+    ]
     if pd.notna(lap):
         subtitle_parts.append(f"Lap: {int(lap)}")
     if pd.notna(race_id):
@@ -336,7 +384,8 @@ def render_banner(snap: pd.DataFrame) -> None:
 
 def main() -> None:
     st.title("🏎️ NASCAR Race Intelligence")
-   
+    st.caption("Bundled version with banner, flag status, tire fix, and green-lap prediction")
+
     auto = st.sidebar.checkbox("Auto Refresh", True)
     rate = st.sidebar.slider("Seconds", 3, 10, 5)
 
@@ -376,11 +425,12 @@ def main() -> None:
     table = table.sort_values("pos", na_position="last").reset_index(drop=True)
 
     leader = table.iloc[0]
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Leader", f"#{leader['vehicle']}")
     c2.metric("Lap", int(leader["lap"]) if pd.notna(leader["lap"]) else "—")
-    c3.metric("Fastest", f"{table['lap_time'].min():.3f}" if table['lap_time'].notna().any() else "—")
-    c4.metric("Avg", f"{table['lap_time'].mean():.3f}" if table['lap_time'].notna().any() else "—")
+    c3.metric("Flag", flag_label(leader.get("flag_state")))
+    c4.metric("Fastest", f"{table['lap_time'].min():.3f}" if table['lap_time'].notna().any() else "—")
+    c5.metric("Avg", f"{table['lap_time'].mean():.3f}" if table['lap_time'].notna().any() else "—")
 
     st.subheader("🏁 Field")
     st.dataframe(format_table(table), use_container_width=True, hide_index=True)
