@@ -7,7 +7,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="NASCAR Race Intelligence v12", layout="wide")
+st.set_page_config(page_title="NASCAR Race Intelligence v14", layout="wide")
 
 LIVE_FEED_URL = "https://cf.nascar.com/live/feeds/live-feed.json"
 REQUEST_TIMEOUT = 10
@@ -44,6 +44,28 @@ def flag_label(v):
     return {1:"Green",2:"Yellow",3:"Red",4:"Checkered",5:"White"}.get(safe_int(v),"—")
 
 
+def classify_track(track_name: Any) -> str:
+    name = str(track_name or "").lower()
+    if any(k in name for k in ["daytona", "talladega", "atlanta motor speedway"]):
+        return "Superspeedway"
+    if any(k in name for k in ["martinsville", "bristol", "richmond", "bowman gray", "north wilkesboro", "clash"]):
+        return "Short Track"
+    if any(k in name for k in ["road course", "roval", "sonoma", "watkins glen", "cota", "chicago street", "indy road"]):
+        return "Road Course"
+    return "Speedway"
+
+
+def track_curve_params(track_name: Any):
+    track_type = classify_track(track_name)
+    if track_type == "Short Track":
+        return {"track_type": track_type, "fresh_laps": 4, "mid_laps": 18, "penalty_1": 0.95, "penalty_2": 0.40, "falloff_rate": 0.030, "falloff_cap": 0.85}
+    if track_type == "Superspeedway":
+        return {"track_type": track_type, "fresh_laps": 2, "mid_laps": 10, "penalty_1": 0.35, "penalty_2": 0.12, "falloff_rate": 0.006, "falloff_cap": 0.12}
+    if track_type == "Road Course":
+        return {"track_type": track_type, "fresh_laps": 3, "mid_laps": 12, "penalty_1": 1.35, "penalty_2": 0.65, "falloff_rate": 0.018, "falloff_cap": 0.55}
+    return {"track_type": track_type, "fresh_laps": 3, "mid_laps": 15, "penalty_1": 1.20, "penalty_2": 0.50, "falloff_rate": 0.018, "falloff_cap": 0.45}
+
+
 def normalize(data):
     rows=[]
     ts=datetime.utcnow()
@@ -70,10 +92,17 @@ def normalize(data):
 
 
 def enrich(df, hist):
-    hist = hist.sort_values(["vehicle","lap","ts"]).drop_duplicates(["vehicle","lap"])
-    hist["last_pit"] = hist.groupby("vehicle")["last_pit"].ffill()
-    hist["stint_start_lap"] = hist["last_pit"].fillna(0)
-    hist["lsp"] = hist["lap"] - hist["stint_start_lap"]
+    hist = hist.sort_values(["vehicle","lap","ts"]).drop_duplicates(["vehicle","lap"], keep="last").copy()
+    hist["pit_event"] = (
+        hist.groupby("vehicle")["pit_count"]
+        .diff()
+        .fillna(0)
+        .clip(lower=0)
+    )
+    hist["stint_id"] = hist.groupby("vehicle")["pit_event"].cumsum()
+    hist["lsp"] = hist.groupby(["vehicle","stint_id"]).cumcount()
+
+    curve = track_curve_params(df.iloc[0]["track_name"] if not df.empty else None)
 
     pred_rows=[]
     for vehicle,g in hist.groupby("vehicle"):
@@ -82,40 +111,45 @@ def enrich(df, hist):
         laps=green["lap_time"].dropna().tail(8)
         base=laps.median() if len(laps)>=3 else np.nan
         lsp=g.iloc[-1]["lsp"]
-        penalty=1.2 if lsp<=1 else 0.5 if lsp==2 else 0
+
+        if pd.isna(lsp):
+            penalty = 0.0
+            tire_falloff = 0.0
+        else:
+            penalty = curve["penalty_1"] if lsp <= 1 else curve["penalty_2"] if lsp == 2 else 0.0
+            tire_falloff = min(max(lsp - curve["fresh_laps"], 0) * curve["falloff_rate"], curve["falloff_cap"])
 
         pred_rows.append({
             "vehicle":vehicle,
-            "pred":base+penalty if pd.notna(base) else np.nan,
-            "lsp":lsp
+            "pred":base + penalty + tire_falloff if pd.notna(base) else np.nan
         })
 
     preds=pd.DataFrame(pred_rows)
     out=df.merge(preds,on="vehicle",how="left")
 
+    latest_lsp=(
+        hist.sort_values(["vehicle","lap","ts"])
+        .groupby("vehicle",as_index=False)
+        .tail(1)[["vehicle","lsp"]]
+    )
+    out=out.merge(latest_lsp,on="vehicle",how="left")
+
     out["delta"] = out["lap_time"] - out["pred"]
 
     def tire_phase(r):
-        lsp = r["lsp"]
-        pit_count = safe_int(r.get("pit_count")) or 0
-        if pd.isna(lsp):
-            return "—"
-        if pit_count == 0:
-            if lsp <= 3:
-                return "Start Run"
-            elif lsp <= 15:
-                return "Opening Stint"
-            else:
-                return "Long Opening Stint"
-        if lsp <= 3:
-            return "Fresh"
-        elif lsp <= 15:
-            return "Mid"
-        else:
-            return "Falloff"
+        lsp=r["lsp"]
+        pit_count=safe_int(r.get("pit_count")) or 0
+        if pd.isna(lsp): return "—"
+        if pit_count==0:
+            if lsp<=curve["fresh_laps"]: return "Start Run"
+            elif lsp<=curve["mid_laps"]: return "Opening Stint"
+            else: return "Long Opening Stint"
+        if lsp<=curve["fresh_laps"]: return "Fresh"
+        elif lsp<=curve["mid_laps"]: return "Mid"
+        else: return "Falloff"
 
     out["tire"] = out.apply(tire_phase, axis=1)
-
+    out["track_type"] = curve["track_type"]
     return out
 
 
@@ -134,10 +168,11 @@ def format_table(df):
 def render_banner(df):
     if df.empty: return
     r=df.iloc[0]
+    track_type = r.get("track_type") or classify_track(r.get("track_name"))
     st.markdown(f"""
     <div class='banner'>
         <div class='banner-title'>🏁 {r.get('track_name')}</div>
-        <div class='banner-subtitle'>Session: {r.get('run_name')} • Flag: {flag_label(r.get('flag_state'))} • Lap: {r.get('lap')}</div>
+        <div class='banner-subtitle'>Session: {r.get('run_name')} • Track Type: {track_type} • Flag: {flag_label(r.get('flag_state'))} • Lap: {r.get('lap')}</div>
     </div>
     """,unsafe_allow_html=True)
 
@@ -159,7 +194,7 @@ hist=pd.DataFrame(st.session_state.hist)
 
 table=enrich(snap,hist)
 
-render_banner(snap)
+render_banner(table)
 
 sort_mode = st.radio("View Mode", ["Race Order", "Attack"], horizontal=True)
 
@@ -175,7 +210,6 @@ c2.metric("Lap",leader["lap"])
 c3.metric("Flag",flag_label(leader["flag_state"]))
 c4.metric("Fastest",f"{table['lap_time'].min():.3f}")
 
-display_table = format_table(table)
-st.dataframe(display_table,use_container_width=True,hide_index=True)
+st.dataframe(format_table(table),use_container_width=True,hide_index=True)
 
 st.rerun()
