@@ -6,12 +6,12 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-import glob
 
-files = glob.glob("nascar-data/cup/*/*.parquet")
-latest_file = max(files)
+st.set_page_config(page_title="NASCAR Race Intelligence v14", layout="wide")
 
-hist = pd.read_parquet(latest_file)
+LIVE_FEED_URL = "https://cf.nascar.com/live/feeds/live-feed.json"
+REQUEST_TIMEOUT = 10
+GREEN_FLAG_STATE = 1
 
 st.markdown("""
 <style>
